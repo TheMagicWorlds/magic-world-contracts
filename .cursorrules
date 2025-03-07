@@ -1,0 +1,9 @@
+When writing Code
+
+- Reflect on 5-7 different possible sources of the problem, distill those down to 1-2 most likely sources, and then add logs to validate your assumptions before we move onto implementing the actual code fix.
+
+- Always write the code in a way that is easy to understand and maintain.
+- Always write the code in a way that is easy to test.
+- Always write the code in a way that is easy to deploy.
+- Always write the code in a way that is easy to scale.
+- Always write the code in a way that is easy to debug.
