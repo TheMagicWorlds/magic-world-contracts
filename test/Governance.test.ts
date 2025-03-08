@@ -1,6 +1,6 @@
 import { expect } from "chai";
 import { deployments, ethers, getNamedAccounts } from "hardhat";
-import { time } from "@nomicfoundation/hardhat-network-helpers";
+import { time, mine } from "@nomicfoundation/hardhat-network-helpers";
 import { MagicWorldGovernance, MagicWorldGovernanceToken } from "../typechain-types";
 
 describe("MagicWorldGovernance", () => {
@@ -34,15 +34,65 @@ describe("MagicWorldGovernance", () => {
         ) as MagicWorldGovernance;
         console.log("Governance Address:", await governance.getAddress());
 
-        // Mint and delegate tokens to accounts for voting
+        // Mint tokens to accounts for voting
         await token.mint(accounts[1].address, ethers.parseEther("100"));
         await token.mint(accounts[2].address, ethers.parseEther("200"));
         await token.mint(accounts[3].address, ethers.parseEther("300"));
 
-        // Delegate voting power (must be called to enable voting)
-        await token.connect(accounts[1]).delegate(accounts[1].address);
-        await token.connect(accounts[2]).delegate(accounts[2].address);
-        await token.connect(accounts[3]).delegate(accounts[3].address);
+        // Create and sign delegation permits
+        const domain = {
+            name: await token.name(),
+            version: '1',
+            chainId: (await ethers.provider.getNetwork()).chainId,
+            verifyingContract: await token.getAddress()
+        };
+
+        const types = {
+            Delegation: [
+                { name: 'delegatee', type: 'address' },
+                { name: 'nonce', type: 'uint256' },
+                { name: 'expiry', type: 'uint256' }
+            ]
+        };
+
+        // Helper function to create and execute delegation permit
+        async function delegateWithPermit(delegator: any, delegatee: string) {
+            const nonce = await token.nonces(delegator.address);
+            const expiry = Math.floor(Date.now() / 1000) + 3600; // 1 hour from now
+
+            const value = {
+                delegatee: delegatee,
+                nonce: nonce,
+                expiry: expiry
+            };
+
+            const signature = await delegator.signTypedData(domain, types, value);
+            const { v, r, s } = ethers.Signature.from(signature);
+
+            // Execute the gasless delegation
+            await token.delegateBySig(
+                delegatee,
+                nonce,
+                expiry,
+                v,
+                r,
+                s
+            );
+        }
+
+        // Execute gasless delegations
+        await delegateWithPermit(accounts[1], accounts[1].address);
+        await delegateWithPermit(accounts[2], accounts[2].address);
+        await delegateWithPermit(accounts[3], accounts[3].address);
+
+        // Add verification logs
+        console.log("Delegation verification:");
+        console.log("Account 1 voting power:",
+            ethers.formatEther(await token.getVotes(accounts[1].address)));
+        console.log("Account 2 voting power:",
+            ethers.formatEther(await token.getVotes(accounts[2].address)));
+        console.log("Account 3 voting power:",
+            ethers.formatEther(await token.getVotes(accounts[3].address)));
 
         return { governance, token, accounts };
     });
@@ -137,7 +187,7 @@ describe("MagicWorldGovernance", () => {
             await governance.connect(accounts[3]).castVote(proposalId, 1);
 
             // Advance blocks past voting period (5 blocks)
-            await time.advanceBlockTo((await ethers.provider.getBlockNumber()) + 6);
+            await mine(6);
 
             // Log final state
             console.log("Before execution state:", await governance.state(proposalId));
@@ -184,7 +234,7 @@ describe("MagicWorldGovernance", () => {
             await governance.connect(accounts[3]).castVote(proposalId, 0); // Against
 
             // Advance blocks past voting period (5 blocks)
-            await time.advanceBlockTo((await ethers.provider.getBlockNumber()) + 6);
+            await mine(6);
 
             // Log final state
             console.log("Final state:", await governance.state(proposalId));
@@ -327,7 +377,7 @@ describe("MagicWorldGovernance", () => {
             }, { for: 0n, against: 0n });
 
             // Advance blocks past voting period
-            await time.advanceBlockTo((await ethers.provider.getBlockNumber()) + 6);
+            await mine(6);
 
             // Get final state
             const finalState = await governance.state(proposalId);
@@ -346,6 +396,139 @@ describe("MagicWorldGovernance", () => {
             // Verify specific vote weights
             expect(voteTally.for).to.equal(ethers.parseEther("100")); // Account 1's votes
             expect(voteTally.against).to.equal(ethers.parseEther("500")); // Account 2 + 3's votes
+        });
+    });
+
+    describe("Delegated Voting", () => {
+        it("Should allow delegated voting through signatures and execution", async () => {
+            const { governance, token, accounts } = await setupFixture();
+
+            // Store proposal parameters for reuse
+            const proposalParams = {
+                targets: [accounts[1].address],
+                values: [0],
+                calldatas: ["0x"],
+                description: "Proposal #1"
+            };
+
+            // Create proposal with stored parameters
+            console.log("\nCreating proposal...");
+            await governance.connect(accounts[1]).propose(
+                proposalParams.targets,
+                proposalParams.values,
+                proposalParams.calldatas,
+                proposalParams.description
+            );
+
+            const proposalId = await governance.hashProposal(
+                proposalParams.targets,
+                proposalParams.values,
+                proposalParams.calldatas,
+                ethers.keccak256(ethers.toUtf8Bytes(proposalParams.description))
+            );
+            console.log("Proposal ID:", proposalId);
+
+            // Log initial state
+            console.log("\nInitial proposal state:", await governance.state(proposalId));
+
+            // Wait for voting delay
+            await time.advanceBlock();
+            await time.advanceBlock();
+            console.log("Proposal state after delay:", await governance.state(proposalId));
+
+            // Updated EIP-712 domain to match OpenZeppelin's Governor contract
+            const domain = {
+                name: "MagicWorldGovernance", //name of the contract
+                version: "1", //version of the contract
+                chainId: (await ethers.provider.getNetwork()).chainId, //chain id of the network
+                verifyingContract: await governance.getAddress() //address of the contract
+            };
+
+            const types = {
+                Ballot: [
+                    { name: "proposalId", type: "uint256" },
+                    { name: "support", type: "uint8" },
+                    { name: "voter", type: "address" },
+                    { name: "nonce", type: "uint256" }
+                ]
+            };
+
+            // Helper function with enhanced debugging
+            async function castVoteBySig(voter: any, proposalId: bigint, support: number) {
+                // Get voter's nonce
+                const voterNonce = await governance.nonces(voter.address);
+                console.log("Voter nonce:", voterNonce);
+
+                const value = {
+                    proposalId: proposalId,
+                    support: support,
+                    voter: voter.address,
+                    nonce: voterNonce
+                };
+
+                // Debug logs
+                console.log("Voter voting power:",
+                    ethers.formatEther(await token.getVotes(voter.address)));
+                console.log("Signing value:", value);
+
+                const signature = await voter.signTypedData(domain, types, value);
+                const sig = ethers.Signature.from(signature);
+
+                // Verify the signature
+                const recoveredAddress = ethers.verifyTypedData(
+                    domain,
+                    types,
+                    value,
+                    signature
+                );
+                console.log("Signature verification:", {
+                    recovered: recoveredAddress,
+                    expected: voter.address,
+                    matches: recoveredAddress.toLowerCase() === voter.address.toLowerCase()
+                });
+
+                // Cast vote using the signature
+                const signatureBytes = ethers.concat([sig.r, sig.s, ethers.toBeArray(sig.v)]);
+                await governance.castVoteBySig(
+                    proposalId,
+                    support,
+                    voter.address,
+                    signatureBytes
+                );
+            }
+
+            // Cast votes
+            console.log("\nCasting vote for account 2...");
+            await castVoteBySig(accounts[2], proposalId, 1);
+
+            console.log("\nCasting vote for account 3...");
+            await castVoteBySig(accounts[3], proposalId, 1);
+
+            // Log vote tallies
+            const proposalVotes = await governance.proposalVotes(proposalId);
+            console.log("\nVote tallies:");
+            console.log("Against:", ethers.formatEther(proposalVotes[0]));
+            console.log("For:", ethers.formatEther(proposalVotes[1]));
+            console.log("Abstain:", ethers.formatEther(proposalVotes[2]));
+
+            // Advance past voting period
+            await mine(6);
+            console.log("\nProposal state before execution:", await governance.state(proposalId));
+
+            // Execute the proposal
+            console.log("\nExecuting proposal...");
+            await expect(governance.execute(
+                proposalParams.targets,
+                proposalParams.values,
+                proposalParams.calldatas,
+                ethers.keccak256(ethers.toUtf8Bytes(proposalParams.description))
+            )).to.emit(governance, "ProposalExecuted")
+                .withArgs(proposalId);
+
+            // Verify final state
+            const finalState = await governance.state(proposalId);
+            console.log("Final proposal state:", finalState);
+            expect(finalState).to.equal(7); // Executed state
         });
     });
 }); 
